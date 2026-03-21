@@ -1,0 +1,1 @@
+migrations and lead-alert system is need ot implemented in frontedn to enable realitme supabase funcitoanlity 
