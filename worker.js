@@ -15,11 +15,11 @@ const TAVILY_API_KEY   = process.env.TAVILY_API_KEY;
 const JINA_API_KEY     = process.env.JINA_API_KEY;
 const SERPER_API_KEY   = process.env.SERPER_API_KEY;
 
-// ─── CONSTANTS ────────────────────────────────────────────────────────────────
+// ─── CONSTANTS (TUNED FOR 100 LEADS) ─────────────────────────────────────────
 const FINAL_OUTPUT_SIZE  = 100;
 const EXTRACT_BATCH_SIZE = 5;
-const MAX_DIR_PAGES      = 2;
-const SUB_QUERY_COUNT    = 8;
+const MAX_DIR_PAGES      = 5;    // was 2 — directories give 10-15 leads per page
+const SUB_QUERY_COUNT    = 14;   // was 8 — more search variety = more unique leads
 
 // ─── LEAD RANK TIERS ─────────────────────────────────────────────────────────
 const TIER_WEBSITE      = "tier_1_website";
@@ -136,6 +136,17 @@ function classifyLeadTier(website, socialMediaLinks) {
     return { tier: TIER_SOCIAL_MEDIA, tierLabel: "Has Social Media" };
   }
   return { tier: TIER_NONE, tierLabel: "No Online Presence" };
+}
+
+function buildBestLink(biz, listing_url, website, source_url) {
+  return listing_url
+    || website
+    || biz.instagram_url?.trim()
+    || biz.facebook_url?.trim()
+    || biz.twitter_url?.trim()
+    || biz.youtube_url?.trim()
+    || biz.other_social_url?.trim()
+    || source_url;
 }
 
 // ─── GPT JSON HELPER ──────────────────────────────────────────────────────────
@@ -266,180 +277,9 @@ async function resolveWebsiteAndSocials(businessName, location) {
   }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// THE FULL EXTRACTION PIPELINE
-// ═══════════════════════════════════════════════════════════════════════════════
-async function executeExtractionPipeline(job) {
-  const { id: preference_id, user_id, search_query } = job;
-
-  console.log(`\n⚙️  Processing Search: "${search_query}"`);
-
-  // ══════════════════════════════════════════════════════════
-  // PHASE 1 — QUERY EXPANSION
-  // ══════════════════════════════════════════════════════════
-  console.log("🧠 [PHASE 1] Expanding query…");
-
-  const expandResult = await gptJson(
-    [{
-      role:    "user",
-      content: `You are a lead-generation expert. Given the search intent below, produce a JSON
-object with key "queries" containing exactly ${SUB_QUERY_COUNT} search strings.
-
-COMPOSITION (follow strictly):
-
-GROUP A — ${Math.ceil(SUB_QUERY_COUNT / 2)} queries targeting DIRECTORY / LISTING sites:
-  Use these site names directly in queries:
-  Justdial, Sulekha, Zomato, Magicpin, Tripadvisor, Yelp, Dineout, EazyDiner, Yellow Pages, LBB
-  Format examples:
-    "justdial [business type] [city/area] contact phone"
-    "zomato [business type] [city] restaurants list"
-  VARY the area/neighbourhood in each query.
-
-GROUP B — ${Math.floor(SUB_QUERY_COUNT / 2)} queries targeting OFFICIAL / DIRECT business websites:
-  Use specific neighbourhoods, business names if known, "official site", "contact us",
-  "phone number", "email", "address".
-  VARY keywords and areas.
-
-Output ONLY the JSON object. No extra keys. No markdown.
-Search intent: "${search_query}"`,
-    }],
-    "phase-1-expand",
-  );
-
-  const subQueries = (
-    expandResult?.queries ??
-    expandResult?.searchQueries ??
-    (expandResult ? Object.values(expandResult)[0] : null) ??
-    [search_query]
-  ).slice(0, SUB_QUERY_COUNT);
-
-  console.log(`✨ [PHASE 1] ${subQueries.length} sub-queries generated.`);
-
-  // ══════════════════════════════════════════════════════════
-  // PHASE 2 — DISCOVERY
-  // ══════════════════════════════════════════════════════════
-  console.log("🔍 [PHASE 2] Running bulk URL discovery…");
-
-  const rawResults = [];
-
-  const [parallelPages, tavilyPages] = await Promise.all([
-    Promise.all(
-      subQueries.map((q) =>
-        fetch("https://api.parallel.ai/v1beta/search", {
-          method:  "POST",
-          headers: { "Content-Type": "application/json", "x-api-key": PARALLEL_API_KEY },
-          body: JSON.stringify({
-            objective: q, search_queries: [q],
-            mode: "fast", max_results: 25,
-            excerpts: { max_chars_per_result: 4000 },
-          }),
-        }).then((r) => r.json()).catch(() => ({ results: [] }))
-      )
-    ),
-    Promise.all(
-      subQueries.map((q) =>
-        fetch("https://api.tavily.com/search", {
-          method:  "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            api_key: TAVILY_API_KEY, query: q,
-            search_depth: "advanced", max_results: 20,
-          }),
-        }).then((r) => r.json()).catch(() => ({ results: [] }))
-      )
-    ),
-  ]);
-
-  for (const page of parallelPages) {
-    for (const item of (page.results ?? [])) {
-      const url = item.url ?? item.content_url;
-      if (url) rawResults.push({ url, snippet: item.excerpts?.join(" ") ?? "" });
-    }
-  }
-  for (const page of tavilyPages) {
-    for (const item of (page.results ?? [])) {
-      if (item.url) rawResults.push({ url: item.url, snippet: item.content ?? "" });
-    }
-  }
-
-  console.log(`🌐 [PHASE 2] ${rawResults.length} total raw URLs collected.`);
-
-  // ══════════════════════════════════════════════════════════
-  // PHASE 3 — FILTER, DEDUP & SORT
-  // ══════════════════════════════════════════════════════════
-  console.log("🧹 [PHASE 3] Filtering and deduplicating…");
-
-  const seenUrls          = new Set();
-  const seenDirectDomains = new Set();
-  const dirPageCount      = new Map();
-
-  const dirTargets    = [];
-  const directTargets = [];
-
-  for (const item of rawResults) {
-    if (seenUrls.has(item.url)) continue;
-    seenUrls.add(item.url);
-
-    const domain = safeHostname(item.url);
-    if (!domain) continue;
-    if (isBlocked(domain)) continue;
-
-    if (isDirectory(domain)) {
-      const count = dirPageCount.get(domain) ?? 0;
-      if (count >= MAX_DIR_PAGES) continue;
-      dirPageCount.set(domain, count + 1);
-      dirTargets.push({ url: item.url, domain, snippet: item.snippet, isDirectory: true });
-    } else {
-      if (seenDirectDomains.has(domain)) continue;
-      seenDirectDomains.add(domain);
-      directTargets.push({ url: item.url, domain, snippet: item.snippet, isDirectory: false });
-    }
-  }
-
-  const targets = [...dirTargets, ...directTargets];
-  console.log(`🎯 [PHASE 3] ${targets.length} targets (${dirTargets.length} directory + ${directTargets.length} direct).`);
-
-  // ══════════════════════════════════════════════════════════
-  // PHASE 4 — EXTRACTION & SCORING
-  // ══════════════════════════════════════════════════════════
-  console.log(`⛏️  [PHASE 4] Extracting via Jina AI…`);
-
-  const allLeads     = [];
-  const seenNames    = new Set();
-  const locationHint = search_query.replace(/without websites?/gi, "").trim();
-
-  for (let i = 0; i < targets.length; i += EXTRACT_BATCH_SIZE) {
-    const batch    = targets.slice(i, i + EXTRACT_BATCH_SIZE);
-    const batchNum = Math.floor(i / EXTRACT_BATCH_SIZE) + 1;
-    const total    = Math.ceil(targets.length / EXTRACT_BATCH_SIZE);
-    console.log(`  Batch ${batchNum}/${total}: ${batch.length} targets…`);
-
-    const batchResults = await Promise.all(
-      batch.map(async (target) => {
-        try {
-          // ── 4A: Fetch page via Jina AI ───────────────────
-          let content = "";
-          const jinaMarkdown = await fetchPageWithJina(target.url);
-
-          if (jinaMarkdown.length >= 200) {
-            content = jinaMarkdown;
-            console.log(`    📄 Jina OK: ${target.domain} (${jinaMarkdown.length} chars)`);
-          } else {
-            content = target.snippet;
-            console.warn(`    ⚠️  Jina short for ${target.domain}, using snippet.`);
-          }
-
-          if (content.length < 80) {
-            console.warn(`    ⚠️  ${target.domain}: too short, skipping.`);
-            return [];
-          }
-
-          // ── 4B: GPT extraction ───────────────────────────
-          const extracted = await gptJson(
-            [
-              {
-                role: "system",
-                content: `You are a lead extraction assistant.
+// ─── GPT EXTRACTION PROMPT BUILDER ────────────────────────────────────────────
+function buildExtractionPrompt(search_query, target) {
+  return `You are a lead extraction assistant.
 
 THE USER'S SEARCH: "${search_query}"
 SOURCE PAGE URL: "${target.url}"
@@ -479,9 +319,134 @@ Rules:
 Return ONLY valid JSON:
 { "businesses": [
   { "company_name": "", "address": "", "phone": "", "email": "", "website": "", "listing_url": "", "instagram_url": "", "facebook_url": "", "twitter_url": "", "youtube_url": "", "other_social_url": "", "description": "" }
-] }`,
-              },
-              { role: "user", content: content.substring(0, 12000) },
+] }`;
+}
+
+// ─── PROCESS ONE EXTRACTED BUSINESS INTO A LEAD ENTRY ─────────────────────────
+function processBusinessToLead({ biz, target, preference_id, search_query, seenNames }) {
+  const name = biz.company_name?.trim();
+  if (!name) return null;
+
+  const norm = normaliseName(name);
+  if (seenNames.has(norm)) return null;
+  seenNames.add(norm);
+
+  const website = biz.website?.trim()
+    ? biz.website.trim()
+    : (target.isDirectory ? "" : target.url);
+
+  let listing_url = "";
+  if (target.isDirectory && biz.listing_url?.trim()) {
+    const resolved = resolveUrl(biz.listing_url.trim(), target.url);
+    listing_url = isValidHttpUrl(resolved) ? resolved : "";
+  }
+
+  const socialMediaLinks = [
+    biz.instagram_url?.trim()    ?? "",
+    biz.facebook_url?.trim()     ?? "",
+    biz.twitter_url?.trim()      ?? "",
+    biz.youtube_url?.trim()      ?? "",
+    biz.other_social_url?.trim() ?? "",
+  ].filter((url) => url && isSocialMediaUrl(url));
+
+  const source_url = target.url;
+  const best_link  = buildBestLink(biz, listing_url, website, source_url);
+
+  const { tier, tierLabel } = classifyLeadTier(website, socialMediaLinks);
+  const tierBonus = TIER_SCORE_BONUS[tier] ?? 0;
+
+  const slug        = norm.replace(/\s+/g, "-").substring(0, 60);
+  const websiteHost = website ? safeHostname(website) : null;
+  const listingHost = listing_url ? safeHostname(listing_url) : null;
+
+  const domainKey = websiteHost && isRealBusinessWebsite(website)
+    ? websiteHost
+    : listingHost
+      ? `${listingHost}#${slug}`
+      : target.isDirectory
+        ? `${target.domain}#${slug}`
+        : target.domain;
+
+  const lead = {
+    preference_id,
+    search_query,
+    domain: domainKey,
+    lead_data: {
+      company_name:       name,
+      address:            biz.address?.trim()          ?? "",
+      phone:              biz.phone?.trim()            ?? "",
+      email:              biz.email?.trim()            ?? "",
+      website,
+      listing_url,
+      source_url,
+      best_link,
+      instagram_url:      biz.instagram_url?.trim()    ?? "",
+      facebook_url:       biz.facebook_url?.trim()     ?? "",
+      twitter_url:        biz.twitter_url?.trim()      ?? "",
+      youtube_url:        biz.youtube_url?.trim()      ?? "",
+      other_social_url:   biz.other_social_url?.trim() ?? "",
+      social_media_links: socialMediaLinks,
+      tier,
+      tier_label:         tierLabel,
+      description:        biz.description?.trim()      ?? "",
+    },
+    status: "verified",
+  };
+
+  const baseScore =
+    (name                    ? 10 : 0) +
+    (biz.phone?.trim()       ? 30 : 0) +
+    (biz.email?.trim()       ? 30 : 0) +
+    (biz.address?.trim()     ? 10 : 0) +
+    (listing_url             ?  8 : 0) +
+    (biz.description?.trim() ?  5 : 0);
+
+  const locationHint = search_query.replace(/without websites?/gi, "").trim();
+
+  return {
+    lead,
+    score: baseScore + tierBonus,
+    tier,
+    tierLabel,
+    needsSerper: (target.isDirectory && !listing_url)
+      ? { name, domain: target.domain, location: locationHint }
+      : undefined,
+    needsEnrichment: (tier === TIER_NONE),
+    businessName: name,
+  };
+}
+
+// ─── EXTRACT LEADS FROM A BATCH OF TARGETS ────────────────────────────────────
+async function extractFromTargets({ targets, search_query, preference_id, seenNames, allLeads }) {
+  for (let i = 0; i < targets.length; i += EXTRACT_BATCH_SIZE) {
+    const batch    = targets.slice(i, i + EXTRACT_BATCH_SIZE);
+    const batchNum = Math.floor(i / EXTRACT_BATCH_SIZE) + 1;
+    const total    = Math.ceil(targets.length / EXTRACT_BATCH_SIZE);
+    console.log(`  Batch ${batchNum}/${total}: ${batch.length} targets…`);
+
+    const batchResults = await Promise.all(
+      batch.map(async (target) => {
+        try {
+          let content = "";
+          const jinaMarkdown = await fetchPageWithJina(target.url);
+
+          if (jinaMarkdown.length >= 200) {
+            content = jinaMarkdown;
+            console.log(`    📄 Jina OK: ${target.domain} (${jinaMarkdown.length} chars)`);
+          } else {
+            content = target.snippet;
+            console.warn(`    ⚠️  Jina short for ${target.domain}, using snippet.`);
+          }
+
+          if (content.length < 80) {
+            console.warn(`    ⚠️  ${target.domain}: too short, skipping.`);
+            return [];
+          }
+
+          const extracted = await gptJson(
+            [
+              { role: "system", content: buildExtractionPrompt(search_query, target) },
+              { role: "user",   content: content.substring(0, 12000) },
             ],
             `extract-${target.domain}`,
           );
@@ -491,110 +456,14 @@ Return ONLY valid JSON:
 
           console.log(`    ✅ ${target.domain}${target.isDirectory ? " [DIR]" : ""}: ${businesses.length} business(es)`);
 
-          const pageResults = [];
-
+          const results = [];
           for (const biz of businesses) {
-            const name = biz.company_name?.trim();
-            if (!name) continue;
-
-            const norm = normaliseName(name);
-            if (seenNames.has(norm)) continue;
-            seenNames.add(norm);
-
-            const website = biz.website?.trim()
-              ? biz.website.trim()
-              : (target.isDirectory ? "" : target.url);
-
-            // Resolve listing_url
-            let listing_url = "";
-            if (target.isDirectory && biz.listing_url?.trim()) {
-              const resolved = resolveUrl(biz.listing_url.trim(), target.url);
-              listing_url = isValidHttpUrl(resolved) ? resolved : "";
-            }
-
-            // Collect social media URLs
-            const socialMediaLinks = [
-              biz.instagram_url?.trim()    ?? "",
-              biz.facebook_url?.trim()     ?? "",
-              biz.twitter_url?.trim()      ?? "",
-              biz.youtube_url?.trim()      ?? "",
-              biz.other_social_url?.trim() ?? "",
-            ].filter((url) => url && isSocialMediaUrl(url));
-
-            const source_url = target.url;
-            const best_link  = listing_url || website || source_url;
-
-            // ── CLASSIFY TIER ───────────────────────────────
-            const { tier, tierLabel } = classifyLeadTier(website, socialMediaLinks);
-            const tierBonus = TIER_SCORE_BONUS[tier] ?? 0;
-
-            // Domain key for dedup
-            const slug        = norm.replace(/\s+/g, "-").substring(0, 60);
-            const websiteHost = website ? safeHostname(website) : null;
-            const listingHost = listing_url ? safeHostname(listing_url) : null;
-
-            const domainKey = websiteHost && isRealBusinessWebsite(website)
-              ? websiteHost
-              : listingHost
-                ? `${listingHost}#${slug}`
-                : target.isDirectory
-                  ? `${target.domain}#${slug}`
-                  : target.domain;
-
-            const lead = {
-              preference_id,
-              search_query,
-              domain: domainKey,
-              lead_data: {
-                company_name:     name,
-                address:          biz.address?.trim()     ?? "",
-                phone:            biz.phone?.trim()       ?? "",
-                email:            biz.email?.trim()       ?? "",
-                website,
-                listing_url,
-                source_url,
-                best_link,
-                instagram_url:    biz.instagram_url?.trim()    ?? "",
-                facebook_url:     biz.facebook_url?.trim()     ?? "",
-                twitter_url:      biz.twitter_url?.trim()      ?? "",
-                youtube_url:      biz.youtube_url?.trim()      ?? "",
-                other_social_url: biz.other_social_url?.trim() ?? "",
-                social_media_links: socialMediaLinks,
-                tier,
-                tier_label:       tierLabel,
-                description:      biz.description?.trim()  ?? "",
-              },
-              status: "verified",
-            };
-
-            // ── SCORING ─────────────────────────────────────
-            const baseScore =
-              (name                    ? 10 : 0) +
-              (biz.phone?.trim()       ? 30 : 0) +
-              (biz.email?.trim()       ? 30 : 0) +
-              (biz.address?.trim()     ? 10 : 0) +
-              (listing_url             ?  8 : 0) +
-              (biz.description?.trim() ?  5 : 0);
-
-            const score = baseScore + tierBonus;
-            const needsEnrichment = (tier === TIER_NONE);
-
-            const needsSerper = (target.isDirectory && !listing_url)
-              ? { name, domain: target.domain, location: locationHint }
-              : undefined;
-
-            pageResults.push({
-              lead,
-              score,
-              tier,
-              tierLabel,
-              needsSerper,
-              needsEnrichment,
-              businessName: name,
+            const entry = processBusinessToLead({
+              biz, target, preference_id, search_query, seenNames,
             });
+            if (entry) results.push(entry);
           }
-
-          return pageResults;
+          return results;
         } catch (err) {
           console.error(`    ⚠️  ${target.domain}:`, err.message);
           return [];
@@ -608,11 +477,177 @@ Return ONLY valid JSON:
 
     console.log(`  Running total: ${allLeads.length} unique leads.`);
 
-    if (allLeads.length >= FINAL_OUTPUT_SIZE * 2) {
-      console.log(`  🎯 Enough leads — stopping extraction early.`);
+    // Stop early only with a safe 3x buffer for dedup losses
+    if (allLeads.length >= FINAL_OUTPUT_SIZE * 3) {
+      console.log(`  🎯 Enough leads (${allLeads.length}) — stopping extraction early.`);
       break;
     }
   }
+}
+
+// ─── DISCOVERY: SEARCH APIs ───────────────────────────────────────────────────
+async function runDiscovery(queries) {
+  const rawResults = [];
+
+  const [parallelPages, tavilyPages] = await Promise.all([
+    Promise.all(
+      queries.map((q) =>
+        fetch("https://api.parallel.ai/v1beta/search", {
+          method:  "POST",
+          headers: { "Content-Type": "application/json", "x-api-key": PARALLEL_API_KEY },
+          body: JSON.stringify({
+            objective: q, search_queries: [q],
+            mode: "fast", max_results: 40,
+            excerpts: { max_chars_per_result: 4000 },
+          }),
+        }).then((r) => r.json()).catch(() => ({ results: [] }))
+      )
+    ),
+    Promise.all(
+      queries.map((q) =>
+        fetch("https://api.tavily.com/search", {
+          method:  "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            api_key: TAVILY_API_KEY, query: q,
+            search_depth: "advanced", max_results: 30,
+          }),
+        }).then((r) => r.json()).catch(() => ({ results: [] }))
+      )
+    ),
+  ]);
+
+  for (const page of parallelPages) {
+    for (const item of (page.results ?? [])) {
+      const url = item.url ?? item.content_url;
+      if (url) rawResults.push({ url, snippet: item.excerpts?.join(" ") ?? "" });
+    }
+  }
+  for (const page of tavilyPages) {
+    for (const item of (page.results ?? [])) {
+      if (item.url) rawResults.push({ url: item.url, snippet: item.content ?? "" });
+    }
+  }
+
+  return rawResults;
+}
+
+// ─── FILTER & DEDUP RAW URLs INTO TARGETS ─────────────────────────────────────
+function filterAndDedup(rawResults, seenUrls, seenDirectDomains, dirPageCount) {
+  const dirTargets    = [];
+  const directTargets = [];
+
+  for (const item of rawResults) {
+    if (seenUrls.has(item.url)) continue;
+    seenUrls.add(item.url);
+
+    const domain = safeHostname(item.url);
+    if (!domain) continue;
+    if (isBlocked(domain)) continue;
+
+    if (isDirectory(domain)) {
+      const count = dirPageCount.get(domain) ?? 0;
+      if (count >= MAX_DIR_PAGES) continue;
+      dirPageCount.set(domain, count + 1);
+      dirTargets.push({ url: item.url, domain, snippet: item.snippet, isDirectory: true });
+    } else {
+      if (seenDirectDomains.has(domain)) continue;
+      seenDirectDomains.add(domain);
+      directTargets.push({ url: item.url, domain, snippet: item.snippet, isDirectory: false });
+    }
+  }
+
+  return [...dirTargets, ...directTargets];
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// THE FULL EXTRACTION PIPELINE
+// ═══════════════════════════════════════════════════════════════════════════════
+async function executeExtractionPipeline(job) {
+  const { id: preference_id, user_id, search_query } = job;
+
+  console.log(`\n⚙️  Processing Search: "${search_query}"`);
+
+  // Shared dedup state — persists across main extraction AND recovery
+  const seenUrls          = new Set();
+  const seenDirectDomains = new Set();
+  const dirPageCount      = new Map();
+  const seenNames         = new Set();
+  const allLeads          = [];
+  const locationHint      = search_query.replace(/without websites?/gi, "").trim();
+
+  // ══════════════════════════════════════════════════════════
+  // PHASE 1 — QUERY EXPANSION
+  // ══════════════════════════════════════════════════════════
+  console.log("🧠 [PHASE 1] Expanding query…");
+
+  const expandResult = await gptJson(
+    [{
+      role:    "user",
+      content: `You are a lead-generation expert. Given the search intent below, produce a JSON
+object with key "queries" containing exactly ${SUB_QUERY_COUNT} search strings.
+
+COMPOSITION (follow strictly):
+
+GROUP A — ${Math.ceil(SUB_QUERY_COUNT / 2)} queries targeting DIRECTORY / LISTING sites:
+  Use these site names directly in queries:
+  Justdial, Sulekha, Zomato, Magicpin, Tripadvisor, Yelp, Dineout, EazyDiner, Yellow Pages, LBB,
+  IndiaMart, TradeIndia, Burrp, WhatShot, NearBuy, TimesCity
+  Format examples:
+    "justdial [business type] [city/area] contact phone"
+    "zomato [business type] [city] restaurants list"
+  VARY the area/neighbourhood in each query. Use DIFFERENT directories in each.
+
+GROUP B — ${Math.floor(SUB_QUERY_COUNT / 2)} queries targeting OFFICIAL / DIRECT business websites:
+  Use specific neighbourhoods, business names if known, "official site", "contact us",
+  "phone number", "email", "address".
+  VARY keywords and areas.
+
+Output ONLY the JSON object. No extra keys. No markdown.
+Search intent: "${search_query}"`,
+    }],
+    "phase-1-expand",
+  );
+
+  const subQueries = (
+    expandResult?.queries ??
+    expandResult?.searchQueries ??
+    (expandResult ? Object.values(expandResult)[0] : null) ??
+    [search_query]
+  ).slice(0, SUB_QUERY_COUNT);
+
+  console.log(`✨ [PHASE 1] ${subQueries.length} sub-queries generated.`);
+
+  // ══════════════════════════════════════════════════════════
+  // PHASE 2 — DISCOVERY
+  // ══════════════════════════════════════════════════════════
+  console.log("🔍 [PHASE 2] Running bulk URL discovery…");
+
+  const rawResults = await runDiscovery(subQueries);
+
+  console.log(`🌐 [PHASE 2] ${rawResults.length} total raw URLs collected.`);
+
+  // ══════════════════════════════════════════════════════════
+  // PHASE 3 — FILTER, DEDUP & SORT
+  // ══════════════════════════════════════════════════════════
+  console.log("🧹 [PHASE 3] Filtering and deduplicating…");
+
+  const targets = filterAndDedup(rawResults, seenUrls, seenDirectDomains, dirPageCount);
+
+  const dirCount    = targets.filter((t) => t.isDirectory).length;
+  const directCount = targets.filter((t) => !t.isDirectory).length;
+  console.log(`🎯 [PHASE 3] ${targets.length} targets (${dirCount} directory + ${directCount} direct).`);
+
+  // ══════════════════════════════════════════════════════════
+  // PHASE 4 — EXTRACTION & SCORING
+  // ══════════════════════════════════════════════════════════
+  console.log(`⛏️  [PHASE 4] Extracting via Jina AI…`);
+
+  await extractFromTargets({
+    targets, search_query, preference_id, seenNames, allLeads,
+  });
+
+  console.log(`📦 [PHASE 4] Main extraction done: ${allLeads.length} leads.`);
 
   // ══════════════════════════════════════════════════════════
   // PHASE 4.5 — SERPER SNIPER: Resolve missing listing URLs
@@ -708,6 +743,64 @@ Return ONLY valid JSON:
   }
 
   // ══════════════════════════════════════════════════════════
+  // PHASE 4.9 — SHORTFALL RECOVERY
+  // Only fires if we're still under 100 leads.
+  // Generates fresh queries, discovers new URLs, extracts.
+  // Zero extra cost when main pipeline delivers enough.
+  // ══════════════════════════════════════════════════════════
+  if (allLeads.length < FINAL_OUTPUT_SIZE) {
+    console.log(`⚠️  [PHASE 4.9] Only ${allLeads.length} leads — need ${FINAL_OUTPUT_SIZE}. Running recovery…`);
+
+    const recoveryResult = await gptJson(
+      [{
+        role: "user",
+        content: `You are a lead-generation expert. I need MORE leads — I only found ${allLeads.length} out of ${FINAL_OUTPUT_SIZE} needed.
+
+Original search: "${search_query}"
+Already used these queries (DO NOT repeat any): ${JSON.stringify(subQueries)}
+
+Generate exactly 8 NEW, COMPLETELY DIFFERENT search queries targeting:
+- DIFFERENT neighbourhoods/areas/cities than the ones above
+- DIFFERENT directory sites (try: IndiaMart, TradeIndia, Sulekha, Magicpin, LBB, NearBuy, WhatShot, TimesCity, Burrp, So.City)
+- DIFFERENT keyword angles ("near me", "top rated", "best", "reviews", "contact number", "phone number", "list of", "directory")
+- Try broader geographic scope if original was too narrow
+
+Return ONLY JSON: { "queries": ["...", "..."] }`,
+      }],
+      "phase-4.9-recovery",
+    );
+
+    const recoveryQueries = (recoveryResult?.queries ?? []).slice(0, 8);
+
+    if (recoveryQueries.length > 0) {
+      console.log(`  🔄 ${recoveryQueries.length} recovery queries generated.`);
+
+      // Discovery
+      const recoveryRaw = await runDiscovery(recoveryQueries);
+      console.log(`  🌐 ${recoveryRaw.length} recovery URLs found.`);
+
+      // Filter (reuses shared dedup state — no duplicates with main run)
+      const recoveryTargets = filterAndDedup(
+        recoveryRaw, seenUrls, seenDirectDomains, dirPageCount,
+      );
+      console.log(`  🎯 ${recoveryTargets.length} new targets after dedup.`);
+
+      // Extract
+      if (recoveryTargets.length > 0) {
+        await extractFromTargets({
+          targets: recoveryTargets,
+          search_query,
+          preference_id,
+          seenNames,
+          allLeads,
+        });
+      }
+
+      console.log(`✅ [PHASE 4.9] Recovery complete. Total: ${allLeads.length} leads.`);
+    }
+  }
+
+  // ══════════════════════════════════════════════════════════
   // FINAL SORT — Tier first, then score within tier
   // ══════════════════════════════════════════════════════════
   allLeads.sort((a, b) => {
@@ -733,7 +826,6 @@ Return ONLY valid JSON:
   if (finalLeads.length > 0) {
     console.log("💾 [PHASE 5] Saving leads…");
 
-    // Deduplicate by domain
     const domainSeen = new Set();
     const dedupedLeads = finalLeads.filter((lead) => {
       const key = lead.domain;
@@ -788,7 +880,6 @@ async function startWorker() {
 
   while (true) {
     try {
-      // 1. Ask DB for the oldest pending job
       const { data: jobs, error: fetchError } = await supabase
         .from("lead_preferences")
         .select("*")
@@ -802,7 +893,6 @@ async function startWorker() {
         const job = jobs[0];
         console.log(`\n📥 Grabbed pending job: ${job.id}`);
 
-        // 2. LOCK THE JOB
         const { data: lockedJob, error: lockError } = await supabase
           .from("lead_preferences")
           .update({ status: "processing", started_at: new Date().toISOString() })
@@ -816,11 +906,9 @@ async function startWorker() {
           continue;
         }
 
-        // 3. EXECUTE THE FULL PIPELINE
         try {
           const result = await executeExtractionPipeline(lockedJob);
 
-          // 4. MARK COMPLETED
           await supabase
             .from("lead_preferences")
             .update({ status: "completed", completed_at: new Date().toISOString() })
@@ -830,14 +918,12 @@ async function startWorker() {
         } catch (pipelineError) {
           console.error(`❌ Pipeline Crashed:`, pipelineError.message);
 
-          // 5. MARK FAILED
           await supabase
             .from("lead_preferences")
             .update({ status: "failed", error_message: pipelineError.message })
             .eq("id", lockedJob.id);
         }
       } else {
-        // Queue is empty — rest for 5 seconds
         await sleep(5000);
       }
     } catch (globalError) {
