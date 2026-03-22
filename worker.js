@@ -18,8 +18,8 @@ const SERPER_API_KEY   = process.env.SERPER_API_KEY;
 // ─── CONSTANTS (TUNED FOR 100 LEADS) ─────────────────────────────────────────
 const FINAL_OUTPUT_SIZE  = 100;
 const EXTRACT_BATCH_SIZE = 5;
-const MAX_DIR_PAGES      = 5;    // was 2 — directories give 10-15 leads per page
-const SUB_QUERY_COUNT    = 14;   // was 8 — more search variety = more unique leads
+const MAX_DIR_PAGES      = 5;
+const SUB_QUERY_COUNT    = 14;
 
 // ─── LEAD RANK TIERS ─────────────────────────────────────────────────────────
 const TIER_WEBSITE      = "tier_1_website";
@@ -477,7 +477,6 @@ async function extractFromTargets({ targets, search_query, preference_id, seenNa
 
     console.log(`  Running total: ${allLeads.length} unique leads.`);
 
-    // Stop early only with a safe 3x buffer for dedup losses
     if (allLeads.length >= FINAL_OUTPUT_SIZE * 3) {
       console.log(`  🎯 Enough leads (${allLeads.length}) — stopping extraction early.`);
       break;
@@ -561,14 +560,13 @@ function filterAndDedup(rawResults, seenUrls, seenDirectDomains, dirPageCount) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// THE FULL EXTRACTION PIPELINE
+// THE FULL EXTRACTION PIPELINE (web_search only — google_maps handled by Edge Fns)
 // ═══════════════════════════════════════════════════════════════════════════════
 async function executeExtractionPipeline(job) {
   const { id: preference_id, user_id, search_query } = job;
 
   console.log(`\n⚙️  Processing Search: "${search_query}"`);
 
-  // Shared dedup state — persists across main extraction AND recovery
   const seenUrls          = new Set();
   const seenDirectDomains = new Set();
   const dirPageCount      = new Map();
@@ -744,9 +742,6 @@ Search intent: "${search_query}"`,
 
   // ══════════════════════════════════════════════════════════
   // PHASE 4.9 — SHORTFALL RECOVERY
-  // Only fires if we're still under 100 leads.
-  // Generates fresh queries, discovers new URLs, extracts.
-  // Zero extra cost when main pipeline delivers enough.
   // ══════════════════════════════════════════════════════════
   if (allLeads.length < FINAL_OUTPUT_SIZE) {
     console.log(`⚠️  [PHASE 4.9] Only ${allLeads.length} leads — need ${FINAL_OUTPUT_SIZE}. Running recovery…`);
@@ -775,17 +770,14 @@ Return ONLY JSON: { "queries": ["...", "..."] }`,
     if (recoveryQueries.length > 0) {
       console.log(`  🔄 ${recoveryQueries.length} recovery queries generated.`);
 
-      // Discovery
       const recoveryRaw = await runDiscovery(recoveryQueries);
       console.log(`  🌐 ${recoveryRaw.length} recovery URLs found.`);
 
-      // Filter (reuses shared dedup state — no duplicates with main run)
       const recoveryTargets = filterAndDedup(
         recoveryRaw, seenUrls, seenDirectDomains, dirPageCount,
       );
       console.log(`  🎯 ${recoveryTargets.length} new targets after dedup.`);
 
-      // Extract
       if (recoveryTargets.length > 0) {
         await extractFromTargets({
           targets: recoveryTargets,
@@ -836,6 +828,44 @@ Return ONLY JSON: { "queries": ["...", "..."] }`,
 
     console.log(`  ${finalLeads.length} leads → ${dedupedLeads.length} after domain dedup.`);
 
+    // ── SANITIZE: Ensure every lead has a valid best_link URL ──────
+    // This prevents the frontend "URL using bad/illegal format" error.
+    for (const lead of dedupedLeads) {
+      const ld = lead.lead_data;
+
+      // Rebuild best_link from scratch — guaranteed valid
+      ld.best_link = ld.listing_url
+        || ld.website
+        || ld.instagram_url
+        || ld.facebook_url
+        || ld.twitter_url
+        || ld.youtube_url
+        || ld.other_social_url
+        || ld.source_url
+        || "";
+
+      // Validate: if best_link is empty or malformed, use safe fallback
+      try {
+        if (!ld.best_link) throw new Error("empty");
+        new URL(ld.best_link);
+      } catch {
+        ld.best_link = ld.source_url
+          || `https://www.google.com/search?q=${encodeURIComponent(ld.company_name || "business")}`;
+      }
+
+      // Clean website field — if present but malformed, clear it
+      if (ld.website) {
+        try { new URL(ld.website); }
+        catch { ld.website = ""; }
+      }
+
+      // Clean listing_url — if present but malformed, clear it
+      if (ld.listing_url) {
+        try { new URL(ld.listing_url); }
+        catch { ld.listing_url = ""; }
+      }
+    }
+
     const { data: inserted, error: leadsError } = await supabase
       .from("leads")
       .upsert(dedupedLeads, { onConflict: "domain" })
@@ -871,19 +901,67 @@ Return ONLY JSON: { "queries": ["...", "..."] }`,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// ZOMBIE JOB CLEANUP
+//
+// Catches jobs where the Edge Function crashed before setting resolved_pipeline.
+// These jobs have: status='pending' AND resolved_pipeline=NULL for over 60 seconds.
+// Rescues them by defaulting to web_search so this worker picks them up.
+// ═══════════════════════════════════════════════════════════════════════════════
+async function cleanupZombieJobs() {
+  try {
+    const cutoff = new Date(Date.now() - 60 * 1000).toISOString();
+
+    const { data: zombies, error } = await supabase
+      .from("lead_preferences")
+      .select("id, search_query, created_at")
+      .eq("status", "pending")
+      .is("resolved_pipeline", null)
+      .lt("created_at", cutoff)
+      .limit(5);
+
+    if (error || !zombies || zombies.length === 0) return;
+
+    console.log(`🧟 [ZOMBIE CLEANUP] Found ${zombies.length} stuck jobs. Rescuing…`);
+
+    for (const zombie of zombies) {
+      const { error: updateErr } = await supabase
+        .from("lead_preferences")
+        .update({ resolved_pipeline: "web_search" })
+        .eq("id", zombie.id)
+        .eq("status", "pending")
+        .is("resolved_pipeline", null);
+
+      if (!updateErr) {
+        console.log(`   🧟→🔍 Rescued: "${zombie.search_query}" (${zombie.id}) → web_search`);
+      }
+    }
+  } catch (err) {
+    console.error("🧟 Zombie cleanup error:", err.message);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // THE DATABASE POLLER (STRICT FIFO QUEUE)
+//
+// CHANGED FROM ORIGINAL:
+//   1. Polling query now filters: .eq("resolved_pipeline", "web_search")
+//      → Google Maps jobs never reach this worker (Edge Functions handle them)
+//   2. Idle branch calls cleanupZombieJobs() before sleeping
+//      → Rescues jobs where Edge Function crashed (resolved_pipeline stuck NULL)
 // ═══════════════════════════════════════════════════════════════════════════════
 async function startWorker() {
   console.log("══════════════════════════════════════════════════════════");
-  console.log("👷 Backend Worker Online. Polling for 'pending' jobs...");
+  console.log("👷 Backend Worker Online. Polling for 'pending' web_search jobs...");
   console.log("══════════════════════════════════════════════════════════");
 
   while (true) {
     try {
+      // ── CHANGED: Only pick up web_search jobs ──────────────────────
       const { data: jobs, error: fetchError } = await supabase
         .from("lead_preferences")
         .select("*")
         .eq("status", "pending")
+        .eq("resolved_pipeline", "web_search")   // ← NEW: skip google_maps jobs
         .order("created_at", { ascending: true })
         .limit(1);
 
@@ -924,6 +1002,8 @@ async function startWorker() {
             .eq("id", lockedJob.id);
         }
       } else {
+        // ── CHANGED: Run zombie cleanup when idle ──────────────────
+        await cleanupZombieJobs();
         await sleep(5000);
       }
     } catch (globalError) {
