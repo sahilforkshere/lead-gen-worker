@@ -37,8 +37,7 @@ function classifyPlace(place: any): {
 }
 
 async function runApifyAndWait(
-  niche: string,
-  location: string,
+  query: string,
   maxResults: number
 ): Promise<any[]> {
   const runRes = await fetch(
@@ -47,14 +46,13 @@ async function runApifyAndWait(
       method:  "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        searchStringsArray:        [niche],
-        locationQuery:             location,
-        
-        // Fetch double so we have enough after deduplication
-        maxCrawledPlacesPerSearch: Math.min(maxResults * 2, 120), 
-        
+        searchStringsArray:        [query],
+        maxCrawledPlacesPerSearch: 10, // Keeping at 10 for testing
         language:                  "en",
-        website:                   "withoutWebsite", // 🚀 The exact filter needed
+        
+        // 🚀 THE EXACT APIFY FILTER YOU FOUND:
+        website:                   "withoutWebsite",
+        
         skipClosedPlaces:          true, 
         maxReviews:                0,
         scrapeSocialMediaProfiles: { facebooks: false, instagrams: false, youtubes: false, tiktoks: false, twitters: false },
@@ -128,34 +126,27 @@ serve(async (req) => {
     console.log(`   target_count: ${target_count}`);
 
     console.log(`\n   Step 1: Fetching Google Maps results…`);
-    const places = await runApifyAndWait(niche, location, target_count);
+    const places = await runApifyAndWait(query, target_count);
     console.log(`   Got ${places.length} places from Apify (No-Website filter applied!)`);
 
     console.log(`\n   Step 2: Classifying leads…`);
 
     const coldLeads:  any[] = [];
     let skippedCount = 0;
-    const seenKeys = new Set<string>(); 
+    const seenDomains = new Set<string>();
 
     for (const place of places) {
       const name = (place.title || "").trim();
       if (!name) continue;
 
       const { has_website, is_newborn, include, skip_reason } = classifyPlace(place);
+
       const website = (place.website || "").trim();
-      
-      // 🛑 Generate a permanent, clickable Google Maps URL
-      const placeId = place.placeId || "";
-      const permanentMapsUrl = placeId 
-        ? `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(name)}&query_place_id=${placeId}`
-        : (place.url || "");
+      const domain  = canonicalDomain(website || place.url);
 
-      // 🛑 Use extracted domain OR the permanent maps URL as the unique dedup key
-      const extractedDomain = canonicalDomain(website); 
-      const finalDomain = extractedDomain || permanentMapsUrl || `maps#${name.toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 40)}`;
-
-      if (seenKeys.has(finalDomain)) continue;
-      seenKeys.add(finalDomain);
+      const dedupKey = domain || name.toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 40);
+      if (seenDomains.has(dedupKey)) continue;
+      seenDomains.add(dedupKey);
 
       const reviewCount = place.reviewsCount ?? 0;
 
@@ -172,32 +163,23 @@ serve(async (req) => {
       const address = place.address || "";
 
       coldLeads.push({
-        // 🚀 NEW FLATTENED COLUMNS
-        company_name:  name,
-        phone:         phone,
-        address:       address,
-        listing_url:   permanentMapsUrl,
-
-        // BASE COLUMNS
         preference_id: null,         
         search_query:  query,
-        domain:        finalDomain, 
+        domain:        domain || `maps#${place.placeId || dedupKey}`,
         source:        "google_maps",
         drip_source:   "cold_drip",
         has_website,
         review_count:  reviewCount,
         status:        "verified",
-        
-        // METADATA BACKUP
         lead_data: {
           company_name:  name,
           address,
           phone,
           email:         place.contactInfo?.emails?.[0] || "",
           website:       website || null,
-          listing_url:   permanentMapsUrl,
-          google_maps_url: permanentMapsUrl,
-          google_place_id: placeId,
+          listing_url:   place.url || "",
+          google_maps_url: place.url || "",
+          google_place_id: place.placeId || "",
           rating:          place.totalScore || null,
           review_count:    reviewCount,
           category:        place.categoryName || niche,
