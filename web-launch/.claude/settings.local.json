@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:brand-alert.whoisxmlapi.com)",
+      "WebFetch(domain:user.whoisxmlapi.com)",
+      "WebFetch(domain:domains-subdomains-discovery.whoisxmlapi.com)"
+    ]
+  }
+}

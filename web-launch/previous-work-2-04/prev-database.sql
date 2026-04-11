@@ -1,0 +1,96 @@
+-- WARNING: This schema is for context only and is not meant to be run.
+-- Table order and constraints may not be valid for execution.
+
+CREATE TABLE public.feedback (
+  id uuid NOT NULL DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL,
+  lead_id uuid,
+  status text NOT NULL DEFAULT 'pending'::text,
+  rating smallint CHECK (rating IS NULL OR rating >= 1 AND rating <= 5),
+  message text,
+  source text NOT NULL DEFAULT 'manual'::text,
+  created_at timestamp with time zone NOT NULL DEFAULT now(),
+  updated_at timestamp with time zone NOT NULL DEFAULT now(),
+  CONSTRAINT feedback_pkey PRIMARY KEY (id),
+  CONSTRAINT feedback_user_id_fkey FOREIGN KEY (user_id) REFERENCES auth.users(id),
+  CONSTRAINT feedback_lead_id_fkey FOREIGN KEY (lead_id) REFERENCES public.leads(id)
+);
+CREATE TABLE public.lead_preferences (
+  id uuid NOT NULL DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL UNIQUE,
+  search_query text NOT NULL,
+  created_at timestamp with time zone NOT NULL DEFAULT now(),
+  updated_at timestamp with time zone NOT NULL DEFAULT now(),
+  status text DEFAULT 'pending'::text,
+  started_at timestamp with time zone,
+  completed_at timestamp with time zone,
+  error_message text,
+  pipeline_type text DEFAULT 'web_search'::text,
+  resolved_pipeline text,
+  apify_run_id text,
+  available_pipelines ARRAY DEFAULT ARRAY['web_search'::text, 'google_maps'::text, 'apollo'::text],
+  selected_pipeline text DEFAULT 'apollo'::text,
+  CONSTRAINT lead_preferences_pkey PRIMARY KEY (id),
+  CONSTRAINT lead_preferences_user_id_fkey FOREIGN KEY (user_id) REFERENCES auth.users(id)
+);
+CREATE TABLE public.leads (
+  id uuid NOT NULL DEFAULT gen_random_uuid(),
+  preference_id uuid,
+  search_query text NOT NULL,
+  lead_data jsonb NOT NULL DEFAULT '{}'::jsonb,
+  status text NOT NULL DEFAULT 'pending'::text,
+  error_log text,
+  created_at timestamp with time zone NOT NULL DEFAULT now(),
+  updated_at timestamp with time zone NOT NULL DEFAULT now(),
+  domain text UNIQUE,
+  dedup_key text UNIQUE,
+  source text DEFAULT 'web_search'::text,
+  has_website boolean,
+  review_count integer,
+  drip_source text,
+  company_name text,
+  phone text,
+  address text,
+  listing_url text,
+  place_id text UNIQUE,
+  email text,
+  rating numeric,
+  domain_launched boolean,
+  domain_age_days integer,
+  domain_authority integer,
+  domain_category text,
+  domain_subcategory text,
+  domain_registered_date text,
+  CONSTRAINT leads_pkey PRIMARY KEY (id),
+  CONSTRAINT leads_preference_id_fkey FOREIGN KEY (preference_id) REFERENCES public.lead_preferences(id)
+);
+CREATE TABLE public.profiles (
+  id uuid NOT NULL,
+  name text,
+  email text,
+  image text,
+  customer_id text,
+  price_id text,
+  has_access boolean DEFAULT false,
+  created_at timestamp with time zone DEFAULT (now() AT TIME ZONE 'UTC'::text),
+  updated_at timestamp with time zone DEFAULT (now() AT TIME ZONE 'UTC'::text),
+  is_monthly_drip boolean DEFAULT false,
+  drip_location text DEFAULT 'London'::text,
+  drip_niche_index integer DEFAULT 0,
+  drip_leads_this_month integer DEFAULT 0,
+  drip_reset_date date DEFAULT CURRENT_DATE,
+  drip_mechanism text DEFAULT 'no_website'::text,
+  drip_target_niche text DEFAULT 'any'::text,
+  CONSTRAINT profiles_pkey PRIMARY KEY (id),
+  CONSTRAINT profiles_id_fkey FOREIGN KEY (id) REFERENCES auth.users(id)
+);
+CREATE TABLE public.user_leads (
+  user_id uuid NOT NULL,
+  lead_id uuid NOT NULL,
+  created_at timestamp with time zone DEFAULT now(),
+  crm_status text DEFAULT 'New'::text,
+  notes text,
+  CONSTRAINT user_leads_pkey PRIMARY KEY (user_id, lead_id),
+  CONSTRAINT user_leads_user_id_fkey FOREIGN KEY (user_id) REFERENCES auth.users(id),
+  CONSTRAINT user_leads_lead_id_fkey FOREIGN KEY (lead_id) REFERENCES public.leads(id)
+); 
